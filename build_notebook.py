@@ -60,6 +60,7 @@ from sklearn.linear_model import LogisticRegression, PoissonRegressor
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import log_loss, accuracy_score, brier_score_loss
 from sklearn.inspection import permutation_importance
+from scipy.stats import poisson
 
 warnings.filterwarnings('ignore')
 pd.set_option('display.max_columns', 100)
@@ -188,6 +189,39 @@ final_x = feat.iloc[[len(matches)]].copy()
 train['result'] = np.select([train.home_score > train.away_score, train.home_score == train.away_score], ['H','D'], default='A')
 display(final_x.T)""")
 
+md("""### Visual 1 — how the teams arrived at today's Elo ratings
+
+The lines below are not another model: they expose the Elo state already used as an input. Each step is a completed match. An upward move means the team performed better than Elo expected; a downward move means it underperformed. Large, surprising, important results create larger jumps. Only the recent period is displayed for readability, although the rating was built sequentially from the full history.""")
+
+code("""elo_history = feat.iloc[:len(matches)][['date','home_team','away_team','home_elo','away_elo']]
+parts=[]
+for team in [FINAL_HOME, FINAL_AWAY]:
+    h=elo_history[elo_history.home_team==team][['date','home_elo']].rename(columns={'home_elo':'pre_match_elo'})
+    a=elo_history[elo_history.away_team==team][['date','away_elo']].rename(columns={'away_elo':'pre_match_elo'})
+    z=pd.concat([h,a]).sort_values('date'); z['team']=team; parts.append(z)
+eh=pd.concat(parts)
+fig,ax=plt.subplots(figsize=(10,4.5))
+for team,color in [(FINAL_HOME,'#c8102e'),(FINAL_AWAY,'#75aadb')]:
+    z=eh[(eh.team==team)&(eh.date>='2018-01-01')]
+    ax.plot(z.date,z.pre_match_elo,label=team,color=color,lw=2)
+ax.axvline(FINAL_DATE,color='black',ls='--',alpha=.5,label='Final')
+ax.set(title='Dynamic Elo before each match (2018–final)',ylabel='Elo rating',xlabel='Date')
+ax.legend(); ax.grid(alpha=.2); plt.show()
+
+# Direct final-feature comparison, expressed in the natural direction “higher favors Spain.”
+comparison=pd.Series({
+ 'Elo edge':final_x.elo_diff.iloc[0]/100,
+ 'Recent points edge':final_x.form_pts_diff.iloc[0],
+ 'Recent scoring edge':final_x.gf_diff.iloc[0],
+ 'Recent defensive edge':final_x.defense_diff.iloc[0],
+ 'Experience edge':final_x.experience_diff.iloc[0],
+ 'Rest edge (days)':(final_x.home_rest.iloc[0]-final_x.away_rest.iloc[0])/5
+})
+colors=['#c8102e' if v>=0 else '#75aadb' for v in comparison]
+ax=comparison.sort_values().plot.barh(figsize=(8,4.5),color=colors,title='Final input differences: right favors Spain, left favors Argentina')
+ax.axvline(0,color='black',lw=1); ax.set_xlabel('Scaled difference (for visual comparison only)'); plt.show()
+print('Note: scaling in the second graph is only for visualization; the models use the original values shown above.')""")
+
 md("""## 3. Modeling window and chronological test
 
 We train on 2000 onward to reflect modern football, then hold out 2022–2026 as a genuine forward test. No random split is used. We compare against a naive class-frequency baseline using multiclass log loss and Brier score.""")
@@ -309,6 +343,17 @@ pi = permutation_importance(boost, te[numeric], te.result, scoring='neg_log_loss
 imp = pd.Series(pi.importances_mean,index=numeric).sort_values()
 imp.plot.barh(figsize=(7,4),title='Permutation importance on forward test'); plt.xlabel('Decrease in predictive performance'); plt.show()""")
 
+md("""### Visual 2 — where the 90-minute prediction comes from
+
+Each group of three bars sums to 100%. Logistic regression is the smoother model; boosting can react to nonlinear combinations. The outcome ensemble averages them 55/45. Disagreement between bars is useful: it makes visible how much the answer depends on the chosen algorithm.""")
+
+code("""prob_compare=pd.DataFrame({'Logistic':pf_log,'Gradient boost':pf_boost,'55/45 ensemble':outcome90},index=['Argentina win','Draw','Spain win'])
+ax=prob_compare.T.plot.bar(figsize=(9,4.8),color=['#75aadb','#999999','#c8102e'],rot=0,
+ title='Predicted result after 90 minutes: outcome models')
+ax.set(ylabel='Probability',ylim=(0,.65)); ax.yaxis.set_major_formatter(lambda x,pos:f'{x:.0%}')
+for container in ax.containers: ax.bar_label(container,labels=[f'{v:.1%}' for v in container.datavalues],padding=2,fontsize=8)
+ax.legend(title='Result',bbox_to_anchor=(1.02,1),loc='upper left'); plt.tight_layout(); plt.show()""")
+
 md("""## 5. Goal model
 
 Two regularized Poisson regressions estimate each team's 90-minute goals. The representation is symmetric: one training row per team per match. Team and opponent identities provide partial historical strength information, while Elo/form describe current state.""")
@@ -349,6 +394,22 @@ fa = pd.DataFrame([{'team':FINAL_AWAY,'opponent':FINAL_HOME,'elo_gap':-final_x.e
 lam_spain = goal_model.predict(goal_prep.transform(fh))[0]
 lam_arg = goal_model.predict(goal_prep.transform(fa))[0]
 print(f'Expected 90-minute goals — Spain {lam_spain:.2f}, Argentina {lam_arg:.2f}')""")
+
+md("""### Visual 3 — the Poisson score grid
+
+Cell $(i,j)$ is the modeled probability that Spain scores $i$ and Argentina scores $j$ in 90 minutes. Add cells below the diagonal for an Argentina win, diagonal cells for a draw, and cells above the diagonal for a Spain win. The three sums become the goal model's result probabilities.""")
+
+code("""shown=6
+score_grid=np.outer(poisson.pmf(np.arange(shown),lam_spain),poisson.pmf(np.arange(shown),lam_arg))
+fig,ax=plt.subplots(figsize=(7,5.5))
+im=ax.imshow(score_grid,cmap='YlOrRd',origin='lower')
+for i in range(shown):
+ for j in range(shown):
+  ax.text(j,i,f'{score_grid[i,j]:.1%}',ha='center',va='center',fontsize=8,
+          color='white' if score_grid[i,j]>.08 else 'black')
+ax.set(xticks=range(shown),yticks=range(shown),xlabel='Argentina goals',ylabel='Spain goals',
+       title='Poisson probability of each 90-minute score')
+fig.colorbar(im,ax=ax,label='Probability'); plt.show()""")
 
 md("""## 6. Monte Carlo: 90 minutes → extra time → penalties
 
@@ -415,6 +476,35 @@ display(winner.to_frame('Lift trophy').style.format('{:.1%}'))
 print('Most common simulated final scores (after ET when needed):')
 display(pd.Series(list(zip(sg,ag))).value_counts(normalize=True).head(10).rename('probability').to_frame().style.format('{:.1%}'))""")
 
+md("""### Visual 4 — from 90-minute outcomes to the trophy
+
+The first panel compares all ingredients: direct classifiers, the goal model, and their final 60/40 blend. The second panel shows why 200,000 simulations are sufficient: the estimated Spain trophy probability fluctuates early and then settles. This convergence removes simulation noise; it does not remove model uncertainty.""")
+
+code("""all_probs=pd.DataFrame({
+ 'Logistic':pf_log,'Boost':pf_boost,'Classifier ensemble':outcome90,
+ 'Poisson goals':poisson90,'Final 60/40 blend':blend90
+},index=['Argentina win','Draw','Spain win'])
+fig,(ax1,ax2)=plt.subplots(1,2,figsize=(14,4.8))
+all_probs.T.plot.bar(ax=ax1,color=['#75aadb','#999999','#c8102e'],rot=25)
+ax1.set(title='How the 90-minute probabilities are assembled',ylabel='Probability',ylim=(0,.65))
+ax1.yaxis.set_major_formatter(lambda x,pos:f'{x:.0%}'); ax1.legend(fontsize=8)
+
+running=np.cumsum(spain_wins)/np.arange(1,N+1)
+checkpoints=np.unique(np.geomspace(10,N,500).astype(int))-1
+ax2.plot(checkpoints+1,running[checkpoints],color='#c8102e')
+ax2.axhline(running[-1],color='black',ls='--',label=f'Final estimate {running[-1]:.1%}')
+ax2.set(xscale='log',title='Monte Carlo convergence',xlabel='Number of simulated finals (log scale)',ylabel='Spain trophy probability')
+ax2.yaxis.set_major_formatter(lambda x,pos:f'{x:.0%}'); ax2.grid(alpha=.2); ax2.legend()
+plt.tight_layout(); plt.show()
+
+fig,ax=plt.subplots(figsize=(7,2.5))
+ax.barh(['Lift trophy'],[winner['Spain']],color='#c8102e',label='Spain')
+ax.barh(['Lift trophy'],[winner['Argentina']],left=[winner['Spain']],color='#75aadb',label='Argentina')
+ax.text(winner['Spain']/2,0,f\"Spain\\n{winner['Spain']:.1%}\",ha='center',va='center',color='white',weight='bold')
+ax.text(winner['Spain']+winner['Argentina']/2,0,f\"Argentina\\n{winner['Argentina']:.1%}\",ha='center',va='center',weight='bold')
+ax.set(xlim=(0,1),title='Final model result after extra time and penalties'); ax.xaxis.set_major_formatter(lambda x,pos:f'{x:.0%}')
+ax.legend(loc='lower center',bbox_to_anchor=(.5,-.5),ncol=2); plt.show()""")
+
 md("""## 7. Sensitivity and final verdict
 
 Model uncertainty matters more than Monte Carlo noise. We vary the blend weight and each side's expected goals by ±10%. If the favorite changes under plausible assumptions, the honest conclusion is “too close to call.”""")
@@ -437,6 +527,22 @@ fav=winner.idxmax(); prob=winner.max()
 print(f'VERDICT: {fav} is the model favorite with a {prob:.1%} chance to lift the trophy.')
 print(f'Sensitivity range for Spain: {sens.Spain_trophy_prob.min():.1%}–{sens.Spain_trophy_prob.max():.1%}.')
 print('Treat this as an analytical estimate, not betting advice.')""")
+
+md("""### Visual 5 — sensitivity heatmap
+
+This heatmap focuses on the middle classifier weight (60%) and changes both teams' scoring rates by ±10%. Redder cells favor Spain; bluer cells favor Argentina. The 50% contour is the boundary where the favorite changes. Seeing that boundary inside the tested range is the clearest visual reason not to call this a confident prediction.""")
+
+code("""mid=sens[sens.classifier_weight==.6].pivot(index='Spain_xG_multiplier',columns='Argentina_xG_multiplier',values='Spain_trophy_prob')
+fig,ax=plt.subplots(figsize=(7,5))
+im=ax.imshow(mid.values,cmap='RdBu_r',vmin=.44,vmax=.56,origin='lower')
+for i in range(len(mid.index)):
+ for j in range(len(mid.columns)):
+  ax.text(j,i,f'{mid.iloc[i,j]:.1%}',ha='center',va='center',weight='bold')
+ax.set(xticks=range(3),xticklabels=[f'{x:.0%}' for x in mid.columns],
+       yticks=range(3),yticklabels=[f'{x:.0%}' for x in mid.index],
+       xlabel='Argentina expected-goal multiplier',ylabel='Spain expected-goal multiplier',
+       title='Spain trophy probability under scoring-rate assumptions')
+fig.colorbar(im,ax=ax,label='Spain trophy probability'); plt.show()""")
 
 md("""## Limitations and responsible interpretation
 
